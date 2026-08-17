@@ -56,7 +56,7 @@ namespace TermChat
 
         static async Task Main(string[] args)
         {
-            //if (!File.Exists("TermChatUpdater.exe") && DevMode == false)
+            //if (!File.Exists("TermChatUpdater.exe") && DevMode == false) 
             //{
             //    Console.Clear();
             //    Console.ForegroundColor = ConsoleColor.Red;

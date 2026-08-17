@@ -478,4 +478,4 @@ namespace TermChat
         public bool isMuted { get; set; }
         public bool isAdmin { get; set; }
     }
-}
+} 

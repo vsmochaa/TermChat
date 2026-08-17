@@ -1,5 +1,6 @@
-﻿using Firebase.Database;
+using Firebase.Database;
 using Firebase.Database.Query;
+using Newtonsoft.Json.Linq;
 using System;
 using System.Diagnostics;
 using System.IO;
@@ -10,9 +11,11 @@ using System.Runtime.CompilerServices;
 using System.Security.Cryptography.X509Certificates;
 using System.Text;
 using System.Text.Json;
+using System.Runtime.InteropServices;
 using System.Threading;
 using System.Threading.Tasks;
 using TermChat_by_vsmocha;
+using static System.Runtime.InteropServices.JavaScript.JSType;
 
 namespace TermChat
 {
@@ -37,8 +40,7 @@ namespace TermChat
    ██    ██      ██   ██ ████  ████ ██      ██   ██ ██   ██    ██    
    ██    █████   ██████  ██ ████ ██ ██      ███████ ███████    ██    
    ██    ██      ██   ██ ██  ██  ██ ██      ██   ██ ██   ██    ██    
-   ██    ███████ ██   ██ ██      ██  ██████ ██   ██ ██   ██    ██
-";
+   ██    ███████ ██   ██ ██      ██  ██████ ██   ██ ██   ██    ██";
         private static string Divider = "=====================================================================";
         private static AccountState UserState = AccountState.NotAuthenticated;
         private static FirebaseClient FirebaseClient = new FirebaseClient(Secrets.FirebaseUrl);
@@ -53,27 +55,34 @@ namespace TermChat
         private static readonly string ChatLogsWebhook = Secrets.ChatLogs;
         private static readonly string AdminLogsWebhook = Secrets.AdminLogs;
         private static readonly string TelemetryLogsWebhook = Secrets.TelemetryLogs;
+        [DllImport("user32.dll")]
+        private static extern bool FlashWindow(IntPtr hwnd, bool bInvert);
+
+        [DllImport("kernel32.dll")]
+        private static extern IntPtr GetConsoleWindow();
 
         static async Task Main(string[] args)
         {
-            //if (!File.Exists("TermChatUpdater.exe") && DevMode == false) 
-            //{
-            //    Console.Clear();
-            //    Console.ForegroundColor = ConsoleColor.Red; 
-            //    Console.WriteLine("=====================================================================");
-            //    Console.WriteLine("                         CRITICAL ERROR                              ");
-            //    Console.WriteLine("=====================================================================");
-            //    Console.ResetColor();
-            //    Console.WriteLine("\nTermChatUpdater.exe was not found in the application directory.");
-            //    Console.WriteLine("The application cannot run or update without the updater executable.");
-            //    Console.WriteLine("\nPlease ensure 'TermChatUpdater.exe' is placed in the same folder.");
-            //    Console.WriteLine("\nPress any key to exit...");
-            //    Console.ReadKey();
-            //    return;
-            //}
+            if (!File.Exists("TermChatUpdater.exe") && !Debugger.IsAttached)
+            {
+                Console.Clear();
+                Console.ForegroundColor = ConsoleColor.Red;
+                Console.WriteLine("=====================================================================");
+                Console.WriteLine("                         CRITICAL ERROR                              ");
+                Console.WriteLine("=====================================================================");
+                Console.ResetColor();
+                Console.WriteLine("\nTermChatUpdater.exe was not found in the application directory.");
+                Console.WriteLine("The application cannot run or update without the updater executable.");
+                Console.WriteLine("\nPlease ensure 'TermChatUpdater.exe' is placed in the same folder.");
+                Console.WriteLine("\nPress any key to exit...");
+                Console.ReadKey();
+                return;
+            }
 
-            //bool updateFound = await CheckForUpdates();
-            //if (updateFound) return;
+            Console.Title = $"TermChat v{CurrentVersion}";
+
+            bool updateFound = await CheckForUpdates();
+            if (updateFound) return;
             while (UserState != AccountState.Terminated)
             {
                 Console.Clear();
@@ -84,18 +93,16 @@ namespace TermChat
 
         private static async Task<bool> CheckForUpdates()
         {
-            Console.WriteLine("Checking for updates...");
-
+            if (Debugger.IsAttached) { return false; }
             try
             {
                 using (HttpClient client = new HttpClient())
                 {
                     client.DefaultRequestHeaders.UserAgent.Add(new ProductInfoHeaderValue("TermChat", "1.0"));
-                    client.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", GithubToken);
+                    client.DefaultRequestHeaders.Accept.Add(new MediaTypeWithQualityHeaderValue("application/vnd.github.raw"));
                     client.DefaultRequestHeaders.CacheControl = new CacheControlHeaderValue { NoCache = true };
 
-                    // Using the raw GitHub user content URL with token authorization headers
-                    string versionUrl = $"https://raw.githubusercontent.com/vsmochaa/TermChat/main/version.txt?t={DateTime.Now.Ticks}";
+                    string versionUrl = $"https://api.github.com/repos/vsmochaa/TermChat/contents/version.txt?t={DateTime.Now.Ticks}";
 
                     HttpResponseMessage response = await client.GetAsync(versionUrl);
 
@@ -110,32 +117,33 @@ namespace TermChat
 
                     string latestVersion = await response.Content.ReadAsStringAsync();
                     latestVersion = latestVersion.Trim();
+                    string cleanedCurrent = CurrentVersion.Trim();
 
-                    if (latestVersion != CurrentVersion)
+                    if (!latestVersion.Equals(cleanedCurrent, StringComparison.OrdinalIgnoreCase))
                     {
-                        Console.WriteLine($"\nUpdate found! Current: {CurrentVersion} -> New: {latestVersion}");
+                        Console.WriteLine($"\nNew update found! Current: {cleanedCurrent} -> New: {latestVersion}");
                         Console.WriteLine("Downloading update...");
-                        await Task.Delay(1500);
-
-                        string exeUrl = $"https://raw.githubusercontent.com/vsmochaa/TermChat/main/TermChat.exe?t={DateTime.Now.Ticks}";
-                        HttpResponseMessage exeResponse = await client.GetAsync(exeUrl);
-
-                        if (!exeResponse.IsSuccessStatusCode)
+                        using (HttpClient downloadClient = new HttpClient())
                         {
-                            Console.ForegroundColor = ConsoleColor.Yellow;
-                            Console.WriteLine($"\n[Notice]: The version update was detected, but TermChat.exe is not uploaded to GitHub yet! (GitHub replied: {exeResponse.StatusCode})");
-                            Console.ResetColor();
-                            await Task.Delay(3500);
-                            return false;
+                            downloadClient.DefaultRequestHeaders.UserAgent.Add(new ProductInfoHeaderValue("TermChat", "1.0"));
+
+                            string exeUrl = $"https://github.com/vsmochaa/TermChat/releases/download/Release/TermChat.exe?t={DateTime.Now.Ticks}";
+                            HttpResponseMessage exeResponse = await downloadClient.GetAsync(exeUrl);
+
+                            if (!exeResponse.IsSuccessStatusCode)
+                            {
+                                Console.ForegroundColor = ConsoleColor.Yellow;
+                                Console.WriteLine($"\n[Notice]: Version update detected, but failed to download TermChat.exe. (GitHub replied: {exeResponse.StatusCode})");
+                                Console.ResetColor();
+                                await Task.Delay(3500);
+                                return false;
+                            }
+
+                            byte[] exeBytes = await exeResponse.Content.ReadAsByteArrayAsync();
+                            File.WriteAllBytes("TermChat_new.exe", exeBytes);
                         }
-
-                        byte[] exeBytes = await exeResponse.Content.ReadAsByteArrayAsync();
-                        File.WriteAllBytes("TermChat_new.exe", exeBytes);
-
-                        await Task.Delay(1500);
                         Console.WriteLine("Launching updater...");
                         Process.Start("TermChatUpdater.exe");
-                        await Task.Delay(1500);
                         return true;
                     }
                 }
@@ -143,10 +151,8 @@ namespace TermChat
             catch (Exception ex)
             {
                 Console.WriteLine($"Could not check for updates: {ex.Message}");
+                await Task.Delay(4000);
             }
-            await Task.Delay(1500);
-            Console.WriteLine("You are up to date!\n");
-            await Task.Delay(1500);
             return false;
         }
 
@@ -211,12 +217,68 @@ namespace TermChat
             }
         }
 
+        private static async Task StartPresenceHeartbeat()
+        {
+            while (UserState == AccountState.SignedIn)
+            {
+                try
+                {
+                    var presenceObj = new
+                    {
+                        LastSeen = DateTime.UtcNow.Ticks,
+                        Username = CurrentUsername
+                    };
+                    await FirebaseClient.Child("Presence").Child(CurrentUsername).PutAsync(presenceObj);
+
+                    int onlineCount = await GetOnlineCount();
+                    Console.Title = $"TermChat v{CurrentVersion}  |  Online: {onlineCount}";
+                }
+                catch (Exception)
+                {
+                }
+                await Task.Delay(15000);
+            }
+        }
+
+        private static async Task<int> GetOnlineCount()
+        {
+            var presenceNodes = await FirebaseClient.Child("Presence").OnceAsync<Newtonsoft.Json.Linq.JObject>();
+            long currentTicks = DateTime.UtcNow.Ticks;
+            long timeoutThreshold = TimeSpan.TicksPerSecond * 30;
+
+            int count = 0;
+            foreach (var node in presenceNodes)
+            {
+                try
+                {
+                    var data = node.Object;
+                    if (data != null && data.TryGetValue("LastSeen", out var lastSeenToken))
+                    {
+                        long lastSeen = lastSeenToken.Value<long>();
+                        if ((currentTicks - lastSeen) < timeoutThreshold)
+                        {
+                            count++;
+                        }
+                    }
+                }
+                catch (Exception)
+                {
+                }
+            }
+            return count;
+        }
+
+        public static void FlashTaskbar()
+        {
+            IntPtr hWnd = GetConsoleWindow();
+            FlashWindow(hWnd, true);
+        }
         static void Heading()
         {
             Console.WriteLine(ASCII);
             Console.WriteLine(Divider);
             Console.ForegroundColor = ConsoleColor.DarkGray;
-            Console.WriteLine("                                                       by vsmocha");
+            Console.WriteLine($"   v{CurrentVersion}                                              by vsmocha");
             Console.ResetColor();
             Console.WriteLine(Divider);
         }
@@ -265,11 +327,12 @@ namespace TermChat
                         {
                             if (username == "mocha" && (Environment.UserName != "mocha" || Environment.MachineName != "DESKTOP-H2AIQU5")) { Error("mocha's account is HWID locked to his PC.."); Console.ReadKey(); return; }
                             if (username == "c" && (Environment.MachineName != "buswifi")) { Error("c's account is HWID locked to his PC.."); Console.ReadKey(); return; }
+                            if (username == "System") { Error("Cannot login to this account."); Console.ReadKey(); return; }
                             if (match.Object.isTerminated == true) { UserState = AccountState.Terminated; Error("Your account has been terminated."); await Task.Delay(5000); return; }
                             UserState = AccountState.SignedIn;
                             CurrentUsername = username;
                             Success("Successfully logged in.");
-                            await DiscordLog("Log In", $"**Username:** {username}\n**Action:** Log In\n**Time:** {DateTime.Now}", AuthLogsWebhook, DiscordLogColors.Green);
+                            await DiscordLog("Log In", $"**Username:** @{username}\n**Action:** Log In\n**Time:** {DateTime.Now}", AuthLogsWebhook, DiscordLogColors.Green);
                             await DiscordHandshakeLog(username);
                             await Task.Delay(1500);
                             await EnterChat();
@@ -302,7 +365,7 @@ namespace TermChat
                         };
                         await FirebaseClient.Child("Users").Child(username).PutAsync(newUser);
                         Success("Account created successfully! You may now sign in.");
-                        await DiscordLog("Sign Up", $"**Username:** {username}\n**Action:** Sign Up\n**Time:** {DateTime.Now}", AuthLogsWebhook, DiscordLogColors.Green);
+                        await DiscordLog("Sign Up", $"**Username:** @{username}\n**Action:** Sign Up\n**Time:** {DateTime.Now}", AuthLogsWebhook, DiscordLogColors.Green);
                         await DiscordHandshakeLog(username);
                         Console.WriteLine("Press any key to return.");
                         Console.ReadKey();
@@ -311,12 +374,18 @@ namespace TermChat
             }
         }
 
-        static async Task StartTunnel()
+        private static async Task StartTunnel()
         {
+            long connectionTimestamp = DateTime.UtcNow.Ticks;
+
             Subscription = FirebaseClient.Child("Messages").AsObservable<ChatModel>().Subscribe(async x =>
             {
+                if (x.EventType == Firebase.Database.Streaming.FirebaseEventType.Delete) { return; }
+
                 if (x.Object != null && x.Object.User != null && x.Object.MessageContent != null)
                 {
+                    if (x.Object.Timestamp < connectionTimestamp) { return; }
+
                     if (x.Object.User == CurrentUsername) { return; }
 
                     var users = await FirebaseClient.Child("Users").OnceAsync<UserModel>();
@@ -331,9 +400,16 @@ namespace TermChat
                         Console.Write(new string(' ', Console.WindowWidth));
                         Console.SetCursorPosition(0, currentTop);
 
+                        if (x.Object.User == "System")
+                        {
+                            Console.ForegroundColor = ConsoleColor.Red;
+                            Console.Write("[System]");
+                            Console.ResetColor();
+                            Console.WriteLine($": {x.Object.MessageContent}");
+                        }
                         if (match.Object.isAdmin)
                         {
-                            Console.Write($"[{x.Object.User} - ");
+                            Console.Write($"[@{x.Object.User} - ");
                             Console.ForegroundColor = ConsoleColor.Blue;
                             Console.Write("ADMIN");
                             Console.ResetColor();
@@ -341,9 +417,9 @@ namespace TermChat
                         }
                         else
                         {
-                            Console.WriteLine($"[{x.Object.User}]: {x.Object.MessageContent}");
+                            Console.WriteLine($"[@{x.Object.User}]: {x.Object.MessageContent}");
                         }
-
+                        FlashTaskbar();
                         Console.Write($"> {CurrentInput}");
                     }
                 }
@@ -357,13 +433,51 @@ namespace TermChat
             var match = users.FirstOrDefault(u => u.Object.Username == CurrentUsername);
             Console.Clear();
             Heading();
-            Console.WriteLine($"Welcome, {CurrentUsername}");
+            Console.WriteLine($"Welcome, @{CurrentUsername}");
             Console.WriteLine("Connecting to chat...");
             await StartTunnel();
             Console.Clear();
             Heading();
-            Console.WriteLine($"Welcome, {CurrentUsername} (Connected)\n");
+            Console.WriteLine($"Welcome, @{CurrentUsername} (Connected)\n");
+            Task.Run(() => StartPresenceHeartbeat());
+            var allMessages = await FirebaseClient.Child("Messages").OnceAsync<ChatModel>();
+            var allUsersList = await FirebaseClient.Child("Users").OnceAsync<UserModel>();
 
+            foreach (var msgNode in allMessages.OrderBy(m => m.Object.Timestamp))
+            {
+                var msg = msgNode.Object;
+                if (msg != null && msg.User != null && msg.MessageContent != null)
+                {
+                    var senderMatch = allUsersList.FirstOrDefault(u => u.Object.Username == msg.User);
+                    if (senderMatch != null && (senderMatch.Object.isMuted || senderMatch.Object.isTerminated))
+                    {
+                        continue;
+                    }
+
+                    bool isAdminSender = senderMatch != null && senderMatch.Object.isAdmin;
+                    bool isSystemSender = senderMatch != null && senderMatch.Object.Username == "System";
+
+                    if (msg.User == "System")
+                    {
+                        Console.ForegroundColor = ConsoleColor.Red;
+                        Console.Write("[System]");
+                        Console.ResetColor();
+                        Console.WriteLine($": {msg.MessageContent}");
+                    }
+                    else if (isAdminSender)
+                    {
+                        Console.Write($"[@{msg.User} - ");
+                        Console.ForegroundColor = ConsoleColor.Blue;
+                        Console.Write("ADMIN");
+                        Console.ResetColor();
+                        Console.WriteLine($"]: {msg.MessageContent}");
+                    }
+                    else
+                    {
+                        Console.WriteLine($"[@{msg.User}]: {msg.MessageContent}");
+                    }
+                }
+            }
             Console.Write("> ");
             CurrentInput.Clear();
 
@@ -389,7 +503,7 @@ namespace TermChat
                                 if (msg.StartsWith("/") && match != null && match.Object.isAdmin)
                                 {
                                     Console.ForegroundColor = ConsoleColor.DarkGray;
-                                    Console.Write($"[{CurrentUsername} - ");
+                                    Console.Write($"[@{CurrentUsername} - ");
                                     Console.ForegroundColor = ConsoleColor.Blue;
                                     Console.Write("ADMIN");
                                     Console.ResetColor();
@@ -401,7 +515,7 @@ namespace TermChat
                                 {
                                     if (match != null && match.Object.isAdmin)
                                     {
-                                        Console.Write($"[{CurrentUsername} - ");
+                                        Console.Write($"[@{CurrentUsername} - ");
                                         Console.ForegroundColor = ConsoleColor.Blue;
                                         Console.Write("ADMIN");
                                         Console.ResetColor();
@@ -409,7 +523,7 @@ namespace TermChat
                                     }
                                     else
                                     {
-                                        Console.WriteLine($"[{CurrentUsername}]: {msg}");
+                                        Console.WriteLine($"[@{CurrentUsername}]: {msg}");
                                     }
                                 }
                                 Task.Run(() => SendAsync(msg));
@@ -451,10 +565,11 @@ namespace TermChat
                 var newMsg = new ChatModel
                 {
                     User = match.Object.Username,
-                    MessageContent = msg
+                    MessageContent = msg,
+                    Timestamp = DateTime.UtcNow.Ticks
                 };
                 await FirebaseClient.Child("Messages").PostAsync(newMsg);
-                await DiscordLog("Chat Log", $"**Username:** {match.Object.Username}\n**Message:** {msg}\n**Time:** {DateTime.Now}", ChatLogsWebhook, DiscordLogColors.Blue);
+                await DiscordLog("Chat Log", $"**Username:** @{match.Object.Username}\n**Message:** {msg}\n**Time:** {DateTime.Now}", ChatLogsWebhook, DiscordLogColors.Blue);
                 return;
             }
         }
@@ -464,7 +579,7 @@ namespace TermChat
             var users = await FirebaseClient.Child("Users").OnceAsync<UserModel>();
             var match = users.FirstOrDefault(u => u.Object.Username == CurrentUsername);
             if (match != null && match.Object.isAdmin == false) { return; }
-            await DiscordLog("Admin Command Log", $"**Username:** {CurrentUsername}\n**Command:** {cmd}\n**Time:** {DateTime.Now}", AdminLogsWebhook, DiscordLogColors.Blue);
+            await DiscordLog("Admin Command Log", $"**Username:** @{CurrentUsername}\n**Command:** {cmd}\n**Time:** {DateTime.Now}", AdminLogsWebhook, DiscordLogColors.Blue);
             var split = cmd.Split(" ");
             switch (split[0])
             {
@@ -638,6 +753,23 @@ namespace TermChat
                         Success("All messages have been wiped from the database!");
                         break;
                     }
+                case "/announce":
+                    {
+                        var announcement = string.Join(" ", split.Skip(1));
+                        if (string.IsNullOrEmpty(announcement)) { Error("Usage: /announce [message]"); return; }
+                        var ann = new ChatModel
+                        {
+                            User = "System",
+                            MessageContent = announcement,
+                            Timestamp = DateTime.UtcNow.Ticks
+                        };
+                        await FirebaseClient.Child("Messages").PostAsync(ann);
+                        Console.ForegroundColor = ConsoleColor.Red;
+                        Console.Write($"[System]");
+                        Console.ResetColor();
+                        Console.Write($": {ann}\n");
+                        break;
+                    }
             }
         }
     }
@@ -646,11 +778,13 @@ namespace TermChat
     {
         public string User { get; set; }
         public string MessageContent { get; set; }
+        public long Timestamp { get; set; }
     }
     public class UserModel
     {
         public string Username { get; set; }
         public string Password { get; set; }
+        public long LastSeen { get; set; }
         public bool isTerminated { get; set; }
         public bool isMuted { get; set; }
         public bool isAdmin { get; set; }

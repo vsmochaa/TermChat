@@ -59,7 +59,7 @@ namespace TermChat
             //if (!File.Exists("TermChatUpdater.exe") && DevMode == false) 
             //{
             //    Console.Clear();
-            //    Console.ForegroundColor = ConsoleColor.Red;
+            //    Console.ForegroundColor = ConsoleColor.Red; 
             //    Console.WriteLine("=====================================================================");
             //    Console.WriteLine("                         CRITICAL ERROR                              ");
             //    Console.WriteLine("=====================================================================");

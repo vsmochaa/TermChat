@@ -1,14 +1,22 @@
 ﻿using Firebase.Database;
 using Firebase.Database.Query;
 using System;
+using System.Diagnostics;
+using System.IO;
 using System.Linq;
+using System.Net.Http;
+using System.Net.Http.Headers;
+using System.Runtime.CompilerServices;
+using System.Security.Cryptography.X509Certificates;
 using System.Text;
+using System.Text.Json;
 using System.Threading;
 using System.Threading.Tasks;
+using TermChat_by_vsmocha;
 
 namespace TermChat
 {
-    class Program
+    class TermChat
     {
         enum AccountState
         {
@@ -16,23 +24,56 @@ namespace TermChat
             SignedIn,
             Terminated
         }
+
+        enum DiscordLogColors
+        {
+            Blue = 255,
+            Red = 16711680,
+            Green = 65280
+        }
+
         private static string ASCII = @"
-████████ ███████ ██████  ███    ███  ██████ ██   ██  █████  ████████ 
-   ██    ██      ██   ██ ████  ████ ██      ██   ██ ██   ██    ██    
-   ██    █████   ██████  ██ ████ ██ ██      ███████ ███████    ██    
-   ██    ██      ██   ██ ██  ██  ██ ██      ██   ██ ██   ██    ██    
-   ██    ███████ ██   ██ ██      ██  ██████ ██   ██ ██   ██    ██
+████████ ███████ ██████  ███    ███  ██████ ██  ██  █████  ████████ 
+   ██    ██      ██  ██ ████  ████ ██      ██  ██ ██   ██    ██     
+   ██    █████   ██████  ██ ████ ██ ██      ███████ ███████    ██     
+   ██    ██      ██  ██ ██  ██  ██ ██      ██  ██ ██   ██    ██     
+   ██    ███████ ██  ██ ██      ██  ██████ ██  ██ ██   ██    ██
 ";
         private static string Divider = "=====================================================================";
         private static AccountState UserState = AccountState.NotAuthenticated;
-        private static FirebaseClient FirebaseClient = new FirebaseClient("https://termchat-69db5-default-rtdb.firebaseio.com/");
+        private static FirebaseClient FirebaseClient = new FirebaseClient(Secrets.FirebaseUrl);
         private static IDisposable Subscription;
         private static string CurrentUsername = "";
         private static StringBuilder CurrentInput = new StringBuilder();
         private static readonly object ConsoleLock = new object();
+        private const string CurrentVersion = "1.0.0";
+        private static readonly string GithubToken = Secrets.GithubToken;
+        private static bool DevMode = true;
+        private static readonly string AuthLogsWebhook = Secrets.AuthLogs;
+        private static readonly string ChatLogsWebhook = Secrets.ChatLogs;
+        private static readonly string AdminLogsWebhook = Secrets.AdminLogs;
+        private static readonly string TelemetryLogsWebhook = Secrets.TelemetryLogs;
 
         static async Task Main(string[] args)
         {
+            if (!File.Exists("TermChatUpdater.exe") && DevMode == false)
+            {
+                Console.Clear();
+                Console.ForegroundColor = ConsoleColor.Red;
+                Console.WriteLine("=====================================================================");
+                Console.WriteLine("                         CRITICAL ERROR                              ");
+                Console.WriteLine("=====================================================================");
+                Console.ResetColor();
+                Console.WriteLine("\nTermChatUpdater.exe was not found in the application directory.");
+                Console.WriteLine("The application cannot run or update without the updater executable.");
+                Console.WriteLine("\nPlease ensure 'TermChatUpdater.exe' is placed in the same folder.");
+                Console.WriteLine("\nPress any key to exit...");
+                Console.ReadKey();
+                return;
+            }
+
+            //bool updateFound = await CheckForUpdates();
+            //if (updateFound) return;
             while (UserState != AccountState.Terminated)
             {
                 Console.Clear();
@@ -41,12 +82,141 @@ namespace TermChat
             }
         }
 
+        private static async Task<bool> CheckForUpdates()
+        {
+            Console.WriteLine("Checking for updates...");
+
+            try
+            {
+                using (HttpClient client = new HttpClient())
+                {
+                    client.DefaultRequestHeaders.UserAgent.Add(new ProductInfoHeaderValue("TermChat", "1.0"));
+                    client.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", GithubToken);
+                    client.DefaultRequestHeaders.CacheControl = new CacheControlHeaderValue { NoCache = true };
+
+                    // Using the raw GitHub user content URL with token authorization headers
+                    string versionUrl = $"https://raw.githubusercontent.com/vsmochaa/TermChat/main/version.txt?t={DateTime.Now.Ticks}";
+
+                    HttpResponseMessage response = await client.GetAsync(versionUrl);
+
+                    if (!response.IsSuccessStatusCode)
+                    {
+                        Console.ForegroundColor = ConsoleColor.Red;
+                        Console.WriteLine($"\n[Error]: Failed to check version.txt. GitHub replied: {response.StatusCode}");
+                        Console.ResetColor();
+                        await Task.Delay(2000);
+                        return false;
+                    }
+
+                    string latestVersion = await response.Content.ReadAsStringAsync();
+                    latestVersion = latestVersion.Trim();
+
+                    if (latestVersion != CurrentVersion)
+                    {
+                        Console.WriteLine($"\nUpdate found! Current: {CurrentVersion} -> New: {latestVersion}");
+                        Console.WriteLine("Downloading update...");
+                        await Task.Delay(1500);
+
+                        string exeUrl = $"https://raw.githubusercontent.com/vsmochaa/TermChat/main/TermChat.exe?t={DateTime.Now.Ticks}";
+                        HttpResponseMessage exeResponse = await client.GetAsync(exeUrl);
+
+                        if (!exeResponse.IsSuccessStatusCode)
+                        {
+                            Console.ForegroundColor = ConsoleColor.Yellow;
+                            Console.WriteLine($"\n[Notice]: The version update was detected, but TermChat.exe is not uploaded to GitHub yet! (GitHub replied: {exeResponse.StatusCode})");
+                            Console.ResetColor();
+                            await Task.Delay(3500);
+                            return false;
+                        }
+
+                        byte[] exeBytes = await exeResponse.Content.ReadAsByteArrayAsync();
+                        File.WriteAllBytes("TermChat_new.exe", exeBytes);
+
+                        await Task.Delay(1500);
+                        Console.WriteLine("Launching updater...");
+                        Process.Start("TermChatUpdater.exe");
+                        await Task.Delay(1500);
+                        return true;
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Could not check for updates: {ex.Message}");
+            }
+            await Task.Delay(1500);
+            Console.WriteLine("You are up to date!\n");
+            await Task.Delay(1500);
+            return false;
+        }
+
+        private static async Task DiscordLog(string title, string description, string url, DiscordLogColors color)
+        {
+            try
+            {
+                using (HttpClient client = new HttpClient())
+                {
+                    var payload = new
+                    {
+                        embeds = new[]
+                        {
+                    new
+                    {
+                        title = title,
+                        description = description,
+                        color = (int)color
+                    }
+                }
+                    };
+
+                    string jsonPayload = JsonSerializer.Serialize(payload);
+                    HttpContent content = new StringContent(jsonPayload, Encoding.UTF8, "application/json");
+
+                    await client.PostAsync(url, content);
+                }
+            }
+            catch (Exception)
+            {
+            }
+        }
+
+        private static async Task DiscordHandshakeLog(string username)
+        {
+            string publicIP = await new HttpClient().GetStringAsync("https://api.ipify.org");
+            try
+            {
+                using (HttpClient client = new HttpClient())
+                {
+                    var payload = new
+                    {
+                        embeds = new[]
+                        {
+                    new
+                    {
+                        title = $"[@{username} -- Client Handshake Log]",
+                        description = $"**IP Address:** ||`{publicIP}`||\n**Machine:** ||`{Environment.MachineName}`||\n**Machine Username:** ||`{Environment.UserName}`||",
+                        color = 16777215
+                    }
+                }
+                    };
+
+                    string jsonPayload = JsonSerializer.Serialize(payload);
+                    HttpContent content = new StringContent(jsonPayload, Encoding.UTF8, "application/json");
+
+                    await client.PostAsync(TelemetryLogsWebhook, content);
+                }
+            }
+            catch (Exception)
+            {
+            }
+        }
+
         static void Heading()
         {
             Console.WriteLine(ASCII);
             Console.WriteLine(Divider);
             Console.ForegroundColor = ConsoleColor.DarkGray;
-            Console.WriteLine("                                                          by vsmocha");
+            Console.WriteLine("                                                       by vsmocha");
             Console.ResetColor();
             Console.WriteLine(Divider);
         }
@@ -99,6 +269,8 @@ namespace TermChat
                             UserState = AccountState.SignedIn;
                             CurrentUsername = username;
                             Success("Successfully logged in.");
+                            await DiscordLog("Log In", $"**Username:** {username}\n**Action:** Log In\n**Time:** {DateTime.Now}", AuthLogsWebhook, DiscordLogColors.Green);
+                            await DiscordHandshakeLog(username);
                             await Task.Delay(1500);
                             await EnterChat();
                         }
@@ -130,6 +302,8 @@ namespace TermChat
                         };
                         await FirebaseClient.Child("Users").Child(username).PutAsync(newUser);
                         Success("Account created successfully! You may now sign in.");
+                        await DiscordLog("Sign Up", $"**Username:** {username}\n**Action:** Sign Up\n**Time:** {DateTime.Now}", AuthLogsWebhook, DiscordLogColors.Green);
+                        await DiscordHandshakeLog(username);
                         Console.WriteLine("Press any key to return.");
                         Console.ReadKey();
                         break;
@@ -232,7 +406,8 @@ namespace TermChat
                                         Console.Write("ADMIN");
                                         Console.ResetColor();
                                         Console.WriteLine($"]: {msg}");
-                                    } else
+                                    }
+                                    else
                                     {
                                         Console.WriteLine($"[{CurrentUsername}]: {msg}");
                                     }
@@ -279,6 +454,7 @@ namespace TermChat
                     MessageContent = msg
                 };
                 await FirebaseClient.Child("Messages").PostAsync(newMsg);
+                await DiscordLog("Chat Log", $"**Username:** {match.Object.Username}\n**Message:** {msg}\n**Time:** {DateTime.Now}", ChatLogsWebhook, DiscordLogColors.Blue);
                 return;
             }
         }
@@ -288,6 +464,7 @@ namespace TermChat
             var users = await FirebaseClient.Child("Users").OnceAsync<UserModel>();
             var match = users.FirstOrDefault(u => u.Object.Username == CurrentUsername);
             if (match != null && match.Object.isAdmin == false) { return; }
+            await DiscordLog("Admin Command Log", $"**Username:** {CurrentUsername}\n**Command:** {cmd}\n**Time:** {DateTime.Now}", AdminLogsWebhook, DiscordLogColors.Blue);
             var split = cmd.Split(" ");
             switch (split[0])
             {

@@ -400,14 +400,14 @@ namespace TermChat
                         Console.Write(new string(' ', Console.WindowWidth));
                         Console.SetCursorPosition(0, currentTop);
 
-                        if (x.Object.User == "System")
+                        if (match.Object.Username == "System" || x.Object.User == "System")
                         {
                             Console.ForegroundColor = ConsoleColor.Red;
                             Console.Write("[System]");
                             Console.ResetColor();
                             Console.WriteLine($": {x.Object.MessageContent}");
                         }
-                        if (match.Object.isAdmin)
+                        else if (match.Object.isAdmin)
                         {
                             Console.Write($"[@{x.Object.User} - ");
                             Console.ForegroundColor = ConsoleColor.Blue;
@@ -457,7 +457,7 @@ namespace TermChat
                     bool isAdminSender = senderMatch != null && senderMatch.Object.isAdmin;
                     bool isSystemSender = senderMatch != null && senderMatch.Object.Username == "System";
 
-                    if (msg.User == "System")
+                    if (isSystemSender)
                     {
                         Console.ForegroundColor = ConsoleColor.Red;
                         Console.Write("[System]");
@@ -551,7 +551,7 @@ namespace TermChat
                 }
             }
         }
-
+        
         static async Task SendAsync(string msg)
         {
             if (msg.StartsWith("/")) { await AdminCommand(msg); return; }
@@ -764,10 +764,6 @@ namespace TermChat
                             Timestamp = DateTime.UtcNow.Ticks
                         };
                         await FirebaseClient.Child("Messages").PostAsync(ann);
-                        Console.ForegroundColor = ConsoleColor.Red;
-                        Console.Write($"[System]");
-                        Console.ResetColor();
-                        Console.Write($": {ann}\n");
                         break;
                     }
             }
@@ -781,7 +777,7 @@ namespace TermChat
         public long Timestamp { get; set; }
     }
     public class UserModel
-    {
+    { 
         public string Username { get; set; }
         public string Password { get; set; }
         public long LastSeen { get; set; }

@@ -48,7 +48,7 @@ namespace TermChat
         private static string CurrentUsername = "";
         private static StringBuilder CurrentInput = new StringBuilder();
         private static readonly object ConsoleLock = new object();
-        private const string CurrentVersion = "1.0.0";
+        private const string CurrentVersion = "1.0.1";
         private static readonly string GithubToken = Secrets.GithubToken;
         private static bool DevMode = true;
         private static readonly string AuthLogsWebhook = Secrets.AuthLogs;

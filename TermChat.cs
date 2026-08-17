@@ -33,11 +33,11 @@ namespace TermChat
         }
 
         private static string ASCII = @"
-████████ ███████ ██████  ███    ███  ██████ ██  ██  █████  ████████ 
-   ██    ██      ██  ██ ████  ████ ██      ██  ██ ██   ██    ██     
-   ██    █████   ██████  ██ ████ ██ ██      ███████ ███████    ██     
-   ██    ██      ██  ██ ██  ██  ██ ██      ██  ██ ██   ██    ██     
-   ██    ███████ ██  ██ ██      ██  ██████ ██  ██ ██   ██    ██
+████████ ███████ ██████  ███    ███  ██████ ██   ██  █████  ████████ 
+   ██    ██      ██   ██ ████  ████ ██      ██   ██ ██   ██    ██    
+   ██    █████   ██████  ██ ████ ██ ██      ███████ ███████    ██    
+   ██    ██      ██   ██ ██  ██  ██ ██      ██   ██ ██   ██    ██    
+   ██    ███████ ██   ██ ██      ██  ██████ ██   ██ ██   ██    ██
 ";
         private static string Divider = "=====================================================================";
         private static AccountState UserState = AccountState.NotAuthenticated;
@@ -56,21 +56,21 @@ namespace TermChat
 
         static async Task Main(string[] args)
         {
-            if (!File.Exists("TermChatUpdater.exe") && DevMode == false)
-            {
-                Console.Clear();
-                Console.ForegroundColor = ConsoleColor.Red;
-                Console.WriteLine("=====================================================================");
-                Console.WriteLine("                         CRITICAL ERROR                              ");
-                Console.WriteLine("=====================================================================");
-                Console.ResetColor();
-                Console.WriteLine("\nTermChatUpdater.exe was not found in the application directory.");
-                Console.WriteLine("The application cannot run or update without the updater executable.");
-                Console.WriteLine("\nPlease ensure 'TermChatUpdater.exe' is placed in the same folder.");
-                Console.WriteLine("\nPress any key to exit...");
-                Console.ReadKey();
-                return;
-            }
+            //if (!File.Exists("TermChatUpdater.exe") && DevMode == false)
+            //{
+            //    Console.Clear();
+            //    Console.ForegroundColor = ConsoleColor.Red;
+            //    Console.WriteLine("=====================================================================");
+            //    Console.WriteLine("                         CRITICAL ERROR                              ");
+            //    Console.WriteLine("=====================================================================");
+            //    Console.ResetColor();
+            //    Console.WriteLine("\nTermChatUpdater.exe was not found in the application directory.");
+            //    Console.WriteLine("The application cannot run or update without the updater executable.");
+            //    Console.WriteLine("\nPlease ensure 'TermChatUpdater.exe' is placed in the same folder.");
+            //    Console.WriteLine("\nPress any key to exit...");
+            //    Console.ReadKey();
+            //    return;
+            //}
 
             //bool updateFound = await CheckForUpdates();
             //if (updateFound) return;

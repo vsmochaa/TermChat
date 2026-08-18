@@ -8,10 +8,11 @@ using System.Linq;
 using System.Net.Http;
 using System.Net.Http.Headers;
 using System.Runtime.CompilerServices;
+using System.Runtime.InteropServices;
 using System.Security.Cryptography.X509Certificates;
 using System.Text;
 using System.Text.Json;
-using System.Runtime.InteropServices;
+using System.Text.RegularExpressions;
 using System.Threading;
 using System.Threading.Tasks;
 using TermChat_by_vsmocha;
@@ -46,13 +47,15 @@ namespace TermChat
         private static FirebaseClient FirebaseClient = new FirebaseClient(Secrets.FirebaseUrl);
         private static IDisposable Subscription;
         private static string CurrentUsername = "";
+        private static string CurrentRoom = "";
         private static StringBuilder CurrentInput = new StringBuilder();
         private static readonly object ConsoleLock = new object();
-        private const string CurrentVersion = "1.0.1";
+        private const string CurrentVersion = "2.0.2";
         private static readonly string GithubToken = Secrets.GithubToken;
         private static bool DevMode = true;
         private static readonly string AuthLogsWebhook = Secrets.AuthLogs;
         private static readonly string ChatLogsWebhook = Secrets.ChatLogs;
+        private static readonly string ChatCommandsWebhook = Secrets.ChatLogs;
         private static readonly string AdminLogsWebhook = Secrets.AdminLogs;
         private static readonly string TelemetryLogsWebhook = Secrets.TelemetryLogs;
         [DllImport("user32.dll")]
@@ -309,7 +312,6 @@ namespace TermChat
             Console.WriteLine(@"
 [1]: Sign In
 [2]: Sign Up");
-            Console.Write("> ");
             string selection = Console.ReadLine() ?? "";
             if (string.IsNullOrEmpty(selection)) { Error("Enter a valid selection!"); await Task.Delay(3000); return; }
             switch (selection.ToLower())
@@ -332,15 +334,16 @@ namespace TermChat
                             UserState = AccountState.SignedIn;
                             CurrentUsername = username;
                             Success("Successfully logged in.");
-                            await DiscordLog("Log In", $"**Username:** @{username}\n**Action:** Log In\n**Time:** {DateTime.Now}", AuthLogsWebhook, DiscordLogColors.Green);
+                            match.Object.AppVersion = CurrentVersion;
+                            await FirebaseClient.Child("Users").Child(match.Key).PutAsync(match.Object);
+                            await JoinRoom("main-chat");
+                            await DiscordLog("Log In", $"**Username:** @{username}\n**Action:** Log In\n**Time:** {DateTime.Now}\n**Version:** {CurrentVersion}", AuthLogsWebhook, DiscordLogColors.Green);
                             await DiscordHandshakeLog(username);
-                            await Task.Delay(1500);
-                            await EnterChat();
                         }
                         else
                         {
                             Error("Incorrect username or password!");
-                            await Task.Delay(3000);
+                            await Task.Delay(1000);
                             return;
                         }
                         break;
@@ -361,7 +364,8 @@ namespace TermChat
                             Password = password,
                             isTerminated = false,
                             isMuted = false,
-                            isAdmin = false
+                            isAdmin = false,
+                            AppVersion = CurrentVersion
                         };
                         await FirebaseClient.Child("Users").Child(username).PutAsync(newUser);
                         Success("Account created successfully! You may now sign in.");
@@ -378,7 +382,7 @@ namespace TermChat
         {
             long connectionTimestamp = DateTime.UtcNow.Ticks;
 
-            Subscription = FirebaseClient.Child("Messages").AsObservable<ChatModel>().Subscribe(async x =>
+            Subscription = FirebaseClient.Child("Rooms").Child(CurrentRoom).Child("Messages").AsObservable<ChatModel>().Subscribe(async x =>
             {
                 if (x.EventType == Firebase.Database.Streaming.FirebaseEventType.Delete) { return; }
 
@@ -390,7 +394,14 @@ namespace TermChat
 
                     var users = await FirebaseClient.Child("Users").OnceAsync<UserModel>();
                     var match = users.FirstOrDefault(u => u.Object.Username == x.Object.User);
+                    var rooms = await FirebaseClient.Child("Rooms").OnceAsync<RoomModel>();
+                    var roomMatch = rooms.FirstOrDefault(r => r.Object.Name == CurrentRoom);
+                    if (roomMatch == null) { return; }
                     if (match == null || match.Object.isMuted || match.Object.isTerminated || UserState != AccountState.SignedIn) { return; }
+
+                    bool isCustomRoom = CurrentRoom != "main-chat";
+                    bool isRoomMod = roomMatch.Object.Mods != null && roomMatch.Object.Mods.Any(m => m.Equals(x.Object.User, StringComparison.OrdinalIgnoreCase));
+                    bool isRoomOwner = roomMatch.Object.Owner != null && roomMatch.Object.Owner.Equals(x.Object.User, StringComparison.OrdinalIgnoreCase);
 
                     lock (ConsoleLock)
                     {
@@ -415,33 +426,108 @@ namespace TermChat
                             Console.ResetColor();
                             Console.WriteLine($"]: {x.Object.MessageContent}");
                         }
+                        else if (isCustomRoom && isRoomMod)
+                        {
+                            Console.Write($"[@{x.Object.User} - ");
+                            Console.ForegroundColor = ConsoleColor.Magenta;
+                            Console.Write("MOD");
+                            Console.ResetColor();
+                            Console.WriteLine($"]: {x.Object.MessageContent}");
+                        }
+                        else if (isCustomRoom && isRoomOwner)
+                        {
+                            Console.Write($"[@{x.Object.User} - ");
+                            Console.ForegroundColor = ConsoleColor.Magenta;
+                            Console.Write("OWNER");
+                            Console.ResetColor();
+                            Console.WriteLine($"]: {x.Object.MessageContent}");
+                        }
                         else
                         {
                             Console.WriteLine($"[@{x.Object.User}]: {x.Object.MessageContent}");
                         }
                         FlashTaskbar();
-                        Console.Write($"> {CurrentInput}");
+                        Console.Write($"{CurrentInput}");
                     }
                 }
             });
             await Task.CompletedTask;
         }
 
-        static async Task EnterChat()
+        static async Task DisposeTunnel()
+        {
+            Subscription?.Dispose();
+        }
+
+        static async Task JoinRoom(string room)
+        {
+            var users = await FirebaseClient.Child("Users").OnceAsync<UserModel>();
+            var match = users.FirstOrDefault(u => u.Object.Username == CurrentUsername);
+            var rooms = await FirebaseClient.Child("Rooms").OnceAsync<RoomModel>();
+            var roomMatch = rooms.FirstOrDefault(r => r.Object.Name == room);
+            if (match == null) { Error($"{CurrentUsername} couldn't be found in Database!"); return; }
+            if (roomMatch == null) { Error($"{room} doesn't exist!"); return; }
+            room = room.TrimStart('#');
+            if (roomMatch.Object.BannedUsers.Contains(CurrentUsername))
+            {
+                Error("You have been banned from this room!");
+                return;
+            }
+            var joinedRooms = match.Object.JoinedRooms ?? new List<string>();
+            if (!joinedRooms.Contains(room))
+            {
+                joinedRooms.Add(room);
+                await FirebaseClient.Child("Users").Child(match.Key).Child("JoinedRooms").PutAsync(joinedRooms);
+            }
+            await DisposeTunnel();
+            await EnterRoom(room);
+        }
+
+        static async Task LeaveRoom(string room)
+        {
+            if (room == "main-chat")
+            {
+                Error("Cannot leave main-chat");
+                return;
+            }
+            var users = await FirebaseClient.Child("Users").OnceAsync<UserModel>();
+            var match = users.FirstOrDefault(u => u.Object.Username == CurrentUsername);
+            if (match == null) { Error($"{CurrentUsername} couldn't be found in Database!"); return; }
+            var joinedRooms = match.Object.JoinedRooms;
+            if (joinedRooms.Contains(room))
+            {
+                joinedRooms.Remove(room);
+                await FirebaseClient.Child("Users").Child(match.Key).Child("JoinedRooms").PutAsync(joinedRooms);
+                if (CurrentRoom == room)
+                {
+                    Success($"Leaving {room}...");
+                    await Task.Delay(3000);
+                    await JoinRoom("main-chat");
+                    return;
+                }
+                Success($"Left {room}");
+            }
+        }
+
+        static async Task EnterRoom(string room)
         {
             var users = await FirebaseClient.Child("Users").OnceAsync<UserModel>();
             var match = users.FirstOrDefault(u => u.Object.Username == CurrentUsername);
             Console.Clear();
             Heading();
+            CurrentRoom = room;
             Console.WriteLine($"Welcome, @{CurrentUsername}");
-            Console.WriteLine("Connecting to chat...");
+            Console.WriteLine($"Connecting to #{room}...");
             await StartTunnel();
             Console.Clear();
             Heading();
-            Console.WriteLine($"Welcome, @{CurrentUsername} (Connected)\n");
+            Console.ForegroundColor = ConsoleColor.Green;
+            Console.WriteLine($"[Room: #{room}] - (@{CurrentUsername} - Connected)\n");
+            Console.ResetColor();
             Task.Run(() => StartPresenceHeartbeat());
-            var allMessages = await FirebaseClient.Child("Messages").OnceAsync<ChatModel>();
+            var allMessages = await FirebaseClient.Child("Rooms").Child(CurrentRoom).Child("Messages").OnceAsync<ChatModel>();
             var allUsersList = await FirebaseClient.Child("Users").OnceAsync<UserModel>();
+            var allRoomsList = await FirebaseClient.Child("Rooms").OnceAsync<RoomModel>();
 
             foreach (var msgNode in allMessages.OrderBy(m => m.Object.Timestamp))
             {
@@ -456,6 +542,11 @@ namespace TermChat
 
                     bool isAdminSender = senderMatch != null && senderMatch.Object.isAdmin;
                     bool isSystemSender = senderMatch != null && senderMatch.Object.Username == "System";
+                    bool isCustomRoom = CurrentRoom != "main-chat";
+                    var roomMatch = isCustomRoom ? allRoomsList.FirstOrDefault(r => r.Object.Name.Equals(CurrentRoom, StringComparison.OrdinalIgnoreCase)) : null;
+
+                    bool isRoomMod = roomMatch != null && roomMatch.Object.Mods != null && roomMatch.Object.Mods.Any(m => m.Equals(msg.User, StringComparison.OrdinalIgnoreCase));
+                    bool isRoomOwner = roomMatch != null && roomMatch.Object.Owner != null && roomMatch.Object.Owner.Equals(msg.User, StringComparison.OrdinalIgnoreCase);
 
                     if (isSystemSender)
                     {
@@ -472,13 +563,28 @@ namespace TermChat
                         Console.ResetColor();
                         Console.WriteLine($"]: {msg.MessageContent}");
                     }
+                    else if (isCustomRoom && isRoomOwner)
+                    {
+                        Console.Write($"[@{msg.User} - ");
+                        Console.ForegroundColor = ConsoleColor.Magenta;
+                        Console.Write("ROOM OWNER");
+                        Console.ResetColor();
+                        Console.WriteLine($"]: {msg.MessageContent}");
+                    }
+                    else if (isCustomRoom && isRoomMod)
+                    {
+                        Console.Write($"[@{msg.User} - ");
+                        Console.ForegroundColor = ConsoleColor.Magenta;
+                        Console.Write("ROOM MOD");
+                        Console.ResetColor();
+                        Console.WriteLine($"]: {msg.MessageContent}");
+                    }
                     else
                     {
                         Console.WriteLine($"[@{msg.User}]: {msg.MessageContent}");
                     }
                 }
             }
-            Console.Write("> ");
             CurrentInput.Clear();
 
             while (UserState == AccountState.SignedIn)
@@ -500,12 +606,32 @@ namespace TermChat
 
                             if (!string.IsNullOrWhiteSpace(msg))
                             {
-                                if (msg.StartsWith("/") && match != null && match.Object.isAdmin)
+                                bool isCustomRoom = CurrentRoom != "main-chat";
+                                var roomMatch = isCustomRoom ? allRoomsList.FirstOrDefault(r => r.Object.Name.Equals(CurrentRoom, StringComparison.OrdinalIgnoreCase)) : null;
+                                bool isSenderMod = roomMatch != null && roomMatch.Object.Mods != null && roomMatch.Object.Mods.Any(m => m.Equals(CurrentUsername, StringComparison.OrdinalIgnoreCase));
+                                bool isSenderOwner = roomMatch != null && roomMatch.Object.Owner != null && roomMatch.Object.Owner.Equals(CurrentUsername, StringComparison.OrdinalIgnoreCase);
+                                bool isAdmin = match != null && match.Object.isAdmin;
+
+                                if (msg.StartsWith("/") && (isAdmin || isSenderOwner || isSenderMod))
                                 {
                                     Console.ForegroundColor = ConsoleColor.DarkGray;
                                     Console.Write($"[@{CurrentUsername} - ");
-                                    Console.ForegroundColor = ConsoleColor.Blue;
-                                    Console.Write("ADMIN");
+                                    if (isAdmin)
+                                    {
+                                        Console.ForegroundColor = ConsoleColor.Blue;
+                                        Console.Write("ADMIN");
+                                    }
+                                    else if (isCustomRoom && isSenderOwner)
+                                    {
+                                        Console.ForegroundColor = ConsoleColor.Magenta;
+                                        Console.Write("ROOM OWNER");
+                                    }
+                                    else if (isCustomRoom && isSenderMod)
+                                    {
+                                        Console.ForegroundColor = ConsoleColor.Magenta;
+                                        Console.Write("ROOM MOD");
+                                    }
+
                                     Console.ResetColor();
                                     Console.ForegroundColor = ConsoleColor.DarkGray;
                                     Console.WriteLine($"]: {msg} [Command messages are hidden]");
@@ -513,11 +639,27 @@ namespace TermChat
                                 }
                                 else
                                 {
-                                    if (match != null && match.Object.isAdmin)
+                                    if (isAdmin)
                                     {
                                         Console.Write($"[@{CurrentUsername} - ");
                                         Console.ForegroundColor = ConsoleColor.Blue;
                                         Console.Write("ADMIN");
+                                        Console.ResetColor();
+                                        Console.WriteLine($"]: {msg}");
+                                    }
+                                    else if (isCustomRoom && isSenderOwner)
+                                    {
+                                        Console.Write($"[@{CurrentUsername} - ");
+                                        Console.ForegroundColor = ConsoleColor.Magenta;
+                                        Console.Write("ROOM OWNER");
+                                        Console.ResetColor();
+                                        Console.WriteLine($"]: {msg}");
+                                    }
+                                    else if (isCustomRoom && isSenderMod)
+                                    {
+                                        Console.Write($"[@{CurrentUsername} - ");
+                                        Console.ForegroundColor = ConsoleColor.Magenta;
+                                        Console.Write("ROOM MOD");
                                         Console.ResetColor();
                                         Console.WriteLine($"]: {msg}");
                                     }
@@ -526,9 +668,8 @@ namespace TermChat
                                         Console.WriteLine($"[@{CurrentUsername}]: {msg}");
                                     }
                                 }
-                                Task.Run(() => SendAsync(msg));
+                                Task.Run(async () => await SendAsync(msg, CurrentRoom));
                             }
-                            Console.Write("> ");
                         }
                         else if (keyInfo.Key == ConsoleKey.Backspace)
                         {
@@ -551,15 +692,20 @@ namespace TermChat
                 }
             }
         }
-        
-        static async Task SendAsync(string msg)
+
+        static async Task SendAsync(string msg, string room)
         {
-            if (msg.StartsWith("/")) { await AdminCommand(msg); return; }
+            if (msg.StartsWith("//")) { await AdminCommand(msg); return; }
+            if (msg.StartsWith("/") || msg.StartsWith("#")) { await ChatCommand(msg); return; }
             var users = await FirebaseClient.Child("Users").OnceAsync<UserModel>();
             var match = users.FirstOrDefault(u => u.Object.Username == CurrentUsername);
+            var rooms = await FirebaseClient.Child("Rooms").OnceAsync<RoomModel>();
+            var roomMatch = rooms.FirstOrDefault(u => u.Object.Name == room);
             if (match == null) { Error("A fatal error has occurred, your account is returning null in database, report this to vsmocha."); return; }
-            if (match.Object.isTerminated) { return; }
-            if (match.Object.isMuted) { Error("You have been muted, you cannot speak."); return; }
+            if (match.Object.isTerminated) { Environment.Exit(0); return; }
+            if (match.Object.isMuted) { Error("You have been muted by a global moderator of TermChat, you cannot speak."); return; }
+            if (roomMatch.Object.MutedUsers.Contains(CurrentUsername)) { Error("You have been muted by the moderators of this room, you cannot speak."); return; }
+            if (roomMatch.Object.BannedUsers.Contains(CurrentUsername)) { Error("You have been banned by the moderators of this room."); await JoinRoom("main-chat"); return; }
             if (UserState == AccountState.SignedIn)
             {
                 var newMsg = new ChatModel
@@ -568,9 +714,415 @@ namespace TermChat
                     MessageContent = msg,
                     Timestamp = DateTime.UtcNow.Ticks
                 };
-                await FirebaseClient.Child("Messages").PostAsync(newMsg);
-                await DiscordLog("Chat Log", $"**Username:** @{match.Object.Username}\n**Message:** {msg}\n**Time:** {DateTime.Now}", ChatLogsWebhook, DiscordLogColors.Blue);
+                await FirebaseClient.Child("Rooms").Child(room).Child("Messages").PostAsync(newMsg);
+                await DiscordLog($"Chat Log - #{room}", $"**Username:** @{match.Object.Username}\n**Message:** {msg}\n**Time:** {DateTime.Now}", ChatLogsWebhook, DiscordLogColors.Blue);
                 return;
+            }
+        }
+
+        static async Task ChatCommand(string cmd)
+        {
+            var users = await FirebaseClient.Child("Users").OnceAsync<UserModel>();
+            var match = users.FirstOrDefault(u => u.Object.Username == CurrentUsername);
+            await DiscordLog($"Chat Command Log - #{CurrentRoom}", $"**Username:** @{match?.Object.Username}\n**Message:** {cmd}\n**Time:** {DateTime.Now}", ChatCommandsWebhook, DiscordLogColors.Blue);
+            var split = cmd.Split(" ");
+
+            if (cmd.StartsWith("#"))
+            {
+                var roomName = cmd.TrimStart('#').ToLower();
+                var rooms = await FirebaseClient.Child("Rooms").OnceAsync<RoomModel>();
+                var roomMatch = rooms.FirstOrDefault(r => r.Object.Name != null && r.Object.Name.Equals(roomName, StringComparison.OrdinalIgnoreCase));
+                var usersList = await FirebaseClient.Child("Users").OnceAsync<UserModel>();
+                var userMatch = usersList.FirstOrDefault(u => u.Object.Username.Equals(CurrentUsername, StringComparison.OrdinalIgnoreCase));
+                var userRooms = userMatch?.Object.JoinedRooms ?? new List<string>();
+                if (userRooms.Any(r => r.Equals(roomName, StringComparison.OrdinalIgnoreCase)))
+                {
+                    Console.ForegroundColor = ConsoleColor.Green;
+                    Console.WriteLine($"Switching..");
+                    Console.ResetColor();
+                    await JoinRoom(roomName);
+                    return;
+                }
+                else
+                {
+                    Console.WriteLine($"You are not a member of #{roomName}! You must /join it before switching.");
+                }
+                return;
+            }
+
+            switch (split[0])
+            {
+                case "/rooms":
+                    {
+                        var rooms = await FirebaseClient.Child("Rooms").OnceAsync<RoomModel>();
+                        if (rooms == null || !rooms.Any())
+                        {
+                            Console.WriteLine("\nNo rooms found in the database!");
+                            break;
+                        }
+                        foreach (var room in rooms)
+                        {
+                            Console.WriteLine($"{room.Object.Name} | Owner: {room.Object.Owner} | Password-Protected: {room.Object.isPassword}");
+                        }
+                        Console.ForegroundColor = ConsoleColor.Blue;
+                        Console.WriteLine("\nUse /join #room-name [Password - Leave blank if none]");
+                        Console.ResetColor();
+                        break;
+                    }
+                case "/createroom":
+                    {
+                        if (split.Length > 3 || split.Length < 2)
+                        {
+                            Error("Usage: /createroom #room-name-here 1234 (<-- Password LEAVE BLANK FOR NO PASSWORD)");
+                            return;
+                        }
+                        string name = Regex.Replace(split[1], @"[^a-zA-Z0-9-]", "").Replace(" ", "-");
+                        var rooms = await FirebaseClient.Child("Rooms").OnceAsync<RoomModel>();
+                        var roomMatch = rooms.FirstOrDefault(r => r.Object.Name == name);
+                        if (roomMatch != null)
+                        {
+                            Error("This name already exists!");
+                            return;
+                        }
+                        string password = "";
+                        bool isPass = false;
+                        if (split.Length == 3)
+                        {
+                            password = split[2].Replace(" ", "");
+                            isPass = true;
+                        } else
+                        {
+                            password = "";
+                            isPass = false;
+
+                        }
+                        var newRoom = new RoomModel
+                        {
+                            Name = name,
+                            Owner = CurrentUsername,
+                            Password = password,
+                            isPassword = isPass,
+                        };
+                        await FirebaseClient.Child("Rooms").Child(name).PutAsync(newRoom);
+                        Success($"Successfully created #{name}!");
+                        break;
+                    }
+                case "/deleteroom":
+                    {
+                        if (split.Length > 2 || split.Length <= 1)
+                        {
+                            Error("Usage: /deleteroom [RoomName]");
+                            return;
+                        }
+                        string roomName = split[1] ?? "";
+                        var rooms = await FirebaseClient.Child("Rooms").OnceAsync<RoomModel>();
+                        var roomMatch = rooms.FirstOrDefault(r => r.Object.Name == roomName);
+                        if (roomMatch == null) { Error($"{roomName} doesn't exist!"); return; }
+                        if (roomMatch.Object.Owner != CurrentUsername) { Error("You don't own this room! If you want to leave a room, use /leave [RoomName]."); return; }
+                        await FirebaseClient.Child("Rooms").Child(roomMatch.Key).DeleteAsync();
+                        break;
+                    }
+                case "/join":
+                    {
+                        var roomName = split[1]?.TrimStart('#') ?? "";
+                        if (string.IsNullOrEmpty(roomName) || split.Length > 3 || split.Length <= 1)
+                        {
+                            Error("Usage: /join #room-name password <-- Leave blank if none");
+                            return;
+                        }
+
+                        string password = split.Length > 2 ? (split[2] ?? "") : "";
+                        var rooms = await FirebaseClient.Child("Rooms").OnceAsync<RoomModel>();
+                        var roomMatch = rooms.FirstOrDefault(r => r.Object.Name.Equals(roomName, StringComparison.OrdinalIgnoreCase));
+
+                        if (roomMatch == null)
+                        {
+                            Error($"#{roomName} doesn't exist!");
+                            return;
+                        }
+
+                        if (roomMatch.Object.isPassword)
+                        {
+                            if (string.IsNullOrEmpty(password))
+                            {
+                                Error($"#{roomName} requires a password!");
+                                return;
+                            }
+
+                            if (roomMatch.Object.Password != password)
+                            {
+                                Error("Password incorrect!");
+                                return;
+                            }
+                        }
+                        Success($"Joining #{roomName}...");
+                        await JoinRoom(roomName);
+                        break;
+                    }
+                case "/leave":
+                    {
+                        if (split.Length > 2 || split.Length <= 1)
+                        {
+                            Error("Usage: /leave #room-name");
+                            return;
+                        }
+                        string roomName = split[1].TrimStart('#') ?? "";
+                        var rooms = await FirebaseClient.Child("Rooms").OnceAsync<RoomModel>();
+                        var roomMatch = rooms.FirstOrDefault(r => r.Object.Name == roomName);
+                        var userMatch = users.FirstOrDefault(u => u.Object.Username == CurrentUsername);
+                        var userRooms = userMatch?.Object.JoinedRooms ?? new List<string>();
+                        if (!userRooms.Contains(roomName) && roomMatch != null)
+                        {
+                            Error($"You aren't a member of #{roomName}");
+                            return;
+                        }
+                        else if (userMatch == null)
+                        {
+                            Error($"{roomName} doesn't exist!");
+                            return;
+                        }
+                        await LeaveRoom(roomName);
+                        break;
+                    }
+                case "/mod":
+                    {
+                        if (split.Length < 3)
+                        {
+                            Error("Usage: /mod <add/remove> <username>");
+                            return;
+                        }
+
+                        var type = split[1]?.ToLower() ?? "";
+                        if (type != "add" && type != "remove")
+                        {
+                            Error("Usage: /mod <add/remove> <username>");
+                            return;
+                        }
+
+                        var rooms = await FirebaseClient.Child("Rooms").OnceAsync<RoomModel>();
+                        var roomMatch = rooms.FirstOrDefault(r => r.Object.Name.Equals(CurrentRoom, StringComparison.OrdinalIgnoreCase));
+
+                        if (roomMatch == null)
+                        {
+                            Error("Room returned null, report this to vsmocha.");
+                            return;
+                        }
+
+                        if (string.IsNullOrEmpty(roomMatch.Object.Owner) || !roomMatch.Object.Owner.Equals(CurrentUsername, StringComparison.OrdinalIgnoreCase))
+                        {
+                            Error("Only the owner can add or remove moderators!");
+                            return;
+                        }
+
+                        string targetInput = split[2] ?? "";
+                        var allUsers = await FirebaseClient.Child("Users").OnceAsync<UserModel>();
+                        var userMatch = allUsers.FirstOrDefault(u => u.Object.Username.Equals(targetInput, StringComparison.OrdinalIgnoreCase));
+
+                        if (userMatch == null)
+                        {
+                            Error($"{targetInput} doesn't exist!");
+                            return;
+                        }
+
+                        string correctUsername = userMatch.Object.Username;
+                        roomMatch.Object.Mods ??= new List<string>();
+                        bool modified = false;
+
+                        switch (type)
+                        {
+                            case "add":
+                                {
+                                    if (!roomMatch.Object.Mods.Any(m => m.Equals(correctUsername, StringComparison.OrdinalIgnoreCase)))
+                                    {
+                                        roomMatch.Object.Mods.Add(correctUsername);
+                                        modified = true;
+                                    }
+                                    break;
+                                }
+                            case "remove":
+                                {
+                                    var existingMod = roomMatch.Object.Mods.FirstOrDefault(m => m.Equals(correctUsername, StringComparison.OrdinalIgnoreCase));
+                                    if (existingMod != null)
+                                    {
+                                        roomMatch.Object.Mods.Remove(existingMod);
+                                        modified = true;
+                                    }
+                                    break;
+                                }
+                        }
+
+                        if (modified)
+                        {
+                            await FirebaseClient.Child("Rooms").Child(roomMatch.Key).Child("Mods").PutAsync(roomMatch.Object.Mods);
+                        }
+                        break;
+                    }
+                case "/mute":
+                    {
+                        if (split.Length > 2 || split.Length < 2)
+                        {
+                            Error("Usage: /mute (username)");
+                            return;
+                        }
+                        string username = split[1] ?? "";
+                        var rooms = await FirebaseClient.Child("Rooms").OnceAsync<RoomModel>();
+                        var roomMatch = rooms.FirstOrDefault(r => r.Object.Name == CurrentRoom);
+                        if (roomMatch == null) { return; }
+                        var userMatch = users.FirstOrDefault(u => u.Object.Username == username);
+                        var userRooms = userMatch?.Object.JoinedRooms ??= new List<string>();
+                        if (userRooms == null) { return; }
+                        bool isOwner = roomMatch.Object.Owner?.Equals(CurrentUsername, StringComparison.OrdinalIgnoreCase) ?? false;
+                        bool isMod = roomMatch.Object.Mods != null && roomMatch.Object.Mods.Any(m => m.Equals(CurrentUsername, StringComparison.OrdinalIgnoreCase));
+                        if (!isMod && !isOwner)
+                        {
+                            Error("Only room moderators can moderate users!");
+                            return;
+                        }
+                        if (userMatch == null)
+                        {
+                            Error($"{username} doesn't exist!");
+                            return;
+                        }
+                        if (!userRooms.Contains(CurrentRoom))
+                        {
+                            Error($"{username} isn't a member of this room!");
+                            return;
+                        }
+                        var mutedUsers = roomMatch.Object.MutedUsers ?? new List<string>();
+                        if (mutedUsers.Contains(username))
+                        {
+                            Error($"{username} is already muted!");
+                            return;
+                        }
+                        mutedUsers.Add(username);
+                        await FirebaseClient.Child("Rooms").Child(roomMatch.Key).Child("MutedUsers").PutAsync(mutedUsers);
+                        Success($"Muted {username}");
+                        break;
+                    }
+                case "/unmute":
+                    {
+                        if (split.Length > 2 || split.Length < 2)
+                        {
+                            Error("Usage: /unmute (username)");
+                            return;
+                        }
+                        string username = split[1] ?? "";
+                        var rooms = await FirebaseClient.Child("Rooms").OnceAsync<RoomModel>();
+                        var roomMatch = rooms.FirstOrDefault(r => r.Object.Name == CurrentRoom);
+                        if (roomMatch == null) { return; }
+                        var userMatch = users.FirstOrDefault(u => u.Object.Username == username);
+                        bool isOwner = roomMatch.Object.Owner?.Equals(CurrentUsername, StringComparison.OrdinalIgnoreCase) ?? false;
+                        bool isMod = roomMatch.Object.Mods != null && roomMatch.Object.Mods.Any(m => m.Equals(CurrentUsername, StringComparison.OrdinalIgnoreCase));
+                        if (!isMod && !isOwner)
+                        {
+                            Error("Only room moderators can moderate users!");
+                            return;
+                        }
+                        if (userMatch == null)
+                        {
+                            Error($"{username} doesn't exist!");
+                            return;
+                        }
+                        var mutedUsers = roomMatch.Object.MutedUsers ??= new List<string>();
+                        if (roomMatch.Object.MutedUsers.Contains(username))
+                        {
+                            mutedUsers.Remove(username);
+                            await FirebaseClient.Child("Rooms").Child(roomMatch.Key).Child("MutedUsers").PutAsync(mutedUsers);
+                            Success($"Unmuted {username}");
+                        }
+                        break;
+                    }
+                case "/ban":
+                    {
+                        if (split.Length > 2 || split.Length < 2)
+                        {
+                            Error("Usage: /ban (username)");
+                            return;
+                        }
+                        string username = split[1] ?? "";
+                        var rooms = await FirebaseClient.Child("Rooms").OnceAsync<RoomModel>();
+                        var roomMatch = rooms.FirstOrDefault(r => r.Object.Name == CurrentRoom);
+                        if (roomMatch == null) { return; }
+                        var userMatch = users.FirstOrDefault(u => u.Object.Username == username);
+                        var userRooms = userMatch?.Object.JoinedRooms ??= new List<string>();
+                        if (userRooms == null) { return; }
+                        bool isOwner = roomMatch.Object.Owner?.Equals(CurrentUsername, StringComparison.OrdinalIgnoreCase) ?? false;
+                        bool isMod = roomMatch.Object.Mods != null && roomMatch.Object.Mods.Any(m => m.Equals(CurrentUsername, StringComparison.OrdinalIgnoreCase));
+                        if (!isMod && !isOwner)
+                        {
+                            Error("Only room moderators can moderate users!");
+                            return;
+                        }
+                        if (userMatch == null)
+                        {
+                            Error($"{username} doesn't exist!");
+                            return;
+                        }
+                        var bannedUsers = roomMatch.Object.BannedUsers ?? new List<string>();
+                        if (bannedUsers.Contains(username))
+                        {
+                            Error($"{username} is already banned!");
+                            return;
+                        }
+                        bannedUsers.Add(username);
+                        await FirebaseClient.Child("Rooms").Child(roomMatch.Key).Child("BannedUsers").PutAsync(bannedUsers);
+                        Success($"Banned {username}");
+                        break;
+                    }
+                case "/unban":
+                    {
+                        if (split.Length > 2 || split.Length < 2)
+                        {
+                            Error("Usage: /unban (username)");
+                            return;
+                        }
+                        string username = split[1] ?? "";
+                        var rooms = await FirebaseClient.Child("Rooms").OnceAsync<RoomModel>();
+                        var roomMatch = rooms.FirstOrDefault(r => r.Object.Name == CurrentRoom);
+                        if (roomMatch == null) { return; }
+                        var userMatch = users.FirstOrDefault(u => u.Object.Username == username);
+                        bool isOwner = roomMatch.Object.Owner?.Equals(CurrentUsername, StringComparison.OrdinalIgnoreCase) ?? false;
+                        bool isMod = roomMatch.Object.Mods != null && roomMatch.Object.Mods.Any(m => m.Equals(CurrentUsername, StringComparison.OrdinalIgnoreCase));
+                        if (!isMod && !isOwner)
+                        {
+                            Error("Only room moderators can moderate users!");
+                            return;
+                        }
+                        if (userMatch == null)
+                        {
+                            Error($"{username} doesn't exist!");
+                            return;
+                        }
+                        var bannedUsers = roomMatch.Object.BannedUsers ??= new List<string>();
+                        if (roomMatch.Object.BannedUsers.Contains(username))
+                        {
+                            bannedUsers.Remove(username);
+                            await FirebaseClient.Child("Rooms").Child(roomMatch.Key).Child("BannedUsers").PutAsync(bannedUsers);
+                            Success($"Unbanned {username}");
+                        }
+                        break;
+                    }
+                case "/cmds":
+                    {
+                        Console.ForegroundColor = ConsoleColor.DarkGray;
+                        Console.WriteLine("\n       [ Commands ]\n");
+                        Console.WriteLine("   #[RoomName] -- Switch to a room you're a member of | Example: #main-chat (Switches you to #main-chat)");
+                        Console.WriteLine("   /rooms -- Show a list of all rooms");
+                        Console.WriteLine("   /join #room-name [password - Leave blank if none] -- Join a room");
+                        Console.WriteLine("   /createroom #room-name [password - Leave blank if none] -- Create a room");
+                        Console.WriteLine("   /deleteroom #room-name -- Delete a room");
+                        Console.WriteLine("   /deleteroom #room-name -- Delete a room");
+                        Console.WriteLine("   /leave #room-name -- Leave a room");
+                        Console.WriteLine("   /mod <add/remove> [username] -- Add a user as a room moderator");
+                        Console.WriteLine("   /mute [username] -- Mute a user from talking in your room");
+                        Console.WriteLine("   /unmute [username] -- Unmute a muted user");
+                        Console.WriteLine("   /ban [username] -- Ban a user from your room");
+                        Console.WriteLine("   /unban [username] -- Ban a user from your room");
+                        Console.WriteLine("   /report [username] [reason] -- COMING SOON!");
+                        Console.WriteLine();
+                        Console.ResetColor();
+                        break;
+                    }
             }
         }
 
@@ -583,10 +1135,10 @@ namespace TermChat
             var split = cmd.Split(" ");
             switch (split[0])
             {
-                case "/terminate":
+                case "//terminate":
                     {
                         string target = split[1];
-                        if (target == null) { Error("Usage: /terminate (or /ban) {username}"); return; }
+                        if (target == null) { Error("Usage: //terminate (or /ban) {username}"); return; }
                         var search = users.FirstOrDefault(u => u.Object.Username == target);
                         if (search == null)
                         {
@@ -602,10 +1154,10 @@ namespace TermChat
                         }
                         break;
                     }
-                case "/ban":
+                case "//ban":
                     {
                         string target = split[1];
-                        if (target == null) { Error("Usage: /terminate (or /ban) {username}"); return; }
+                        if (target == null) { Error("Usage: //terminate (or /ban) {username}"); return; }
                         var search = users.FirstOrDefault(u => u.Object.Username == target);
                         if (search == null)
                         {
@@ -621,10 +1173,10 @@ namespace TermChat
                         }
                         break;
                     }
-                case "/unterminate":
+                case "//unterminate":
                     {
                         string target = split[1];
-                        if (target == null) { Error("Usage: /unterminate (or /unban) {username}"); return; }
+                        if (target == null) { Error("Usage: //unterminate (or /unban) {username}"); return; }
                         var search = users.FirstOrDefault(u => u.Object.Username == target);
                         if (search == null)
                         {
@@ -640,10 +1192,10 @@ namespace TermChat
                         }
                         break;
                     }
-                case "/unban":
+                case "//unban":
                     {
                         string target = split[1];
-                        if (target == null) { Error("Usage: /unterminate (or /unban) {username}"); return; }
+                        if (target == null) { Error("Usage: //unterminate (or /unban) {username}"); return; }
                         var search = users.FirstOrDefault(u => u.Object.Username == target);
                         if (search == null)
                         {
@@ -659,10 +1211,10 @@ namespace TermChat
                         }
                         break;
                     }
-                case "/mute":
+                case "//mute":
                     {
                         string target = split[1];
-                        if (target == null) { Error("Usage: /mute {username}"); return; }
+                        if (target == null) { Error("Usage: //mute {username}"); return; }
                         var search = users.FirstOrDefault(u => u.Object.Username == target);
                         if (search == null)
                         {
@@ -678,10 +1230,10 @@ namespace TermChat
                         }
                         break;
                     }
-                case "/unmute":
+                case "//unmute":
                     {
                         string target = split[1];
-                        if (target == null) { Error("Usage: /unmute {username}"); return; }
+                        if (target == null) { Error("Usage: //unmute {username}"); return; }
                         var search = users.FirstOrDefault(u => u.Object.Username == target);
                         if (search == null)
                         {
@@ -697,10 +1249,10 @@ namespace TermChat
                         }
                         break;
                     }
-                case "/admin":
+                case "//admin":
                     {
                         string target = split[1];
-                        if (target == null) { Error("Usage: /admin {username}"); return; }
+                        if (target == null) { Error("Usage: //admin {username}"); return; }
                         var search = users.FirstOrDefault(u => u.Object.Username == target);
                         if (search == null)
                         {
@@ -716,10 +1268,10 @@ namespace TermChat
                         }
                         break;
                     }
-                case "/unadmin":
+                case "//unadmin":
                     {
                         string target = split[1];
-                        if (target == null) { Error("Usage: /unadmin {username}"); return; }
+                        if (target == null) { Error("Usage: //unadmin {username}"); return; }
                         var search = users.FirstOrDefault(u => u.Object.Username == target);
                         if (search == null)
                         {
@@ -735,35 +1287,35 @@ namespace TermChat
                         }
                         break;
                     }
-                case "/cleandb":
-                    {
-                        await FirebaseClient.Child("Messages").DeleteAsync();
-                        Success("All messages have been wiped from the database!");
-                        break;
-                    }
-                case "/wipe":
-                    {
-                        await FirebaseClient.Child("Messages").DeleteAsync();
-                        Success("All messages have been wiped from the database!");
-                        break;
-                    }
-                case "/clear":
-                    {
-                        await FirebaseClient.Child("Messages").DeleteAsync();
-                        Success("All messages have been wiped from the database!");
-                        break;
-                    }
-                case "/announce":
+                case "//announce":
                     {
                         var announcement = string.Join(" ", split.Skip(1));
-                        if (string.IsNullOrEmpty(announcement)) { Error("Usage: /announce [message]"); return; }
+                        if (string.IsNullOrEmpty(announcement))
+                        {
+                            Error("Usage: //announce [message]");
+                            return;
+                        }
                         var ann = new ChatModel
                         {
                             User = "System",
                             MessageContent = announcement,
                             Timestamp = DateTime.UtcNow.Ticks
                         };
-                        await FirebaseClient.Child("Messages").PostAsync(ann);
+                        await FirebaseClient.Child("Rooms").Child(CurrentRoom).Child("Messages").PostAsync(ann);
+                        break;
+                    }
+                case "//cmds":
+                    {
+                        Console.ForegroundColor = ConsoleColor.DarkGray;
+                        Console.WriteLine("\n       [ Commands ]\n");
+                        Console.WriteLine("   //terminate [username]  OR  //ban -- Terminate (permanently ban) a user's account");
+                        Console.WriteLine("   //unterminate [username]  OR  //unban -- Remove a user's termination");
+                        Console.WriteLine("   //mute [username] -- Globally mute a user everywhere");
+                        Console.WriteLine("   //unmute [username] -- Globally unmute a user everywhere");
+                        Console.WriteLine("   //announce -- Send a [System] announcement");
+                        Console.WriteLine("   //admin #room-name [password - Leave blank if none] -- Join a room");
+                        Console.WriteLine();
+                        Console.ResetColor();
                         break;
                     }
             }
@@ -775,14 +1327,27 @@ namespace TermChat
         public string User { get; set; }
         public string MessageContent { get; set; }
         public long Timestamp { get; set; }
+        public string Room { get; set; }
     }
     public class UserModel
     { 
         public string Username { get; set; }
         public string Password { get; set; }
         public long LastSeen { get; set; }
+        public List<string> JoinedRooms { get; set; } = new List<string>();
+        public string AppVersion { get; set; }
         public bool isTerminated { get; set; }
-        public bool isMuted { get; set; }
+        public bool isMuted { get; set; } 
         public bool isAdmin { get; set; }
+    }
+    public class RoomModel
+    {
+        public string Name { get; set; }
+        public string Password { get; set; }
+        public bool isPassword { get; set; }
+        public string Owner { get; set; }
+        public List<string> Mods { get; set; } = new List<string>();
+        public List<string> MutedUsers { get; set; } = new List<string>();
+        public List<string> BannedUsers { get; set; } = new List<string>();
     }
 }
